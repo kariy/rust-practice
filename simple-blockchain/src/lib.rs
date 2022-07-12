@@ -1,23 +1,97 @@
 use bincode;
 use crypto::digest::Digest;
 use crypto::sha3::Sha3;
-use hex::ToHex;
-use serde::ser::{Serialize, SerializeStruct, Serializer};
+use hex::{FromHex, FromHexError, ToHex};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::fs;
 use std::{
     fmt::Debug,
     fmt::Display,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub fn run() {
-    let genesis = Block {
+pub struct Config {
+    pub genesis_file: Option<String>,
+}
+
+impl Config {
+    pub fn new(mut args: impl Iterator<Item = String>) -> Result<Self, &'static str> {
+        args.next();
+
+        let genesis_file = args.next();
+
+        Ok(Config { genesis_file })
+    }
+}
+
+fn parse_hex_string<T>(string: &str) -> Result<T, T::Error>
+where
+    T: FromHex,
+{
+    <T>::from_hex(string)
+}
+
+pub fn parse_hex_string_as_bytes(hex_string: &str) -> Result<Bytes32, FromHexError> {
+    let hex_string = hex_string.strip_prefix("0x").unwrap_or_else(|| hex_string);
+    let bytes = parse_hex_string(hex_string).unwrap();
+
+    Ok(Bytes(bytes))
+}
+
+pub fn parse_hex_string_as_address(hex_string: &str) -> Result<Address, FromHexError> {
+    let hex_string = hex_string.strip_prefix("0x").unwrap_or_else(|| hex_string);
+    let bytes = parse_hex_string(hex_string).unwrap();
+
+    Ok(Bytes(bytes))
+}
+
+pub fn init_genesis(filename: &str) -> Result<Block, &'static str> {
+    let json = fs::read_to_string(filename).unwrap();
+    let genesis: Value = serde_json::from_str(&json).unwrap();
+
+    let mut transactions: Vec<Transaction> = Vec::new();
+
+    for tx in genesis["transactions"].as_array().unwrap().iter() {
+        match (
+            parse_hex_string_as_address(tx["from"].as_str().unwrap()),
+            parse_hex_string_as_address(tx["to"].as_str().unwrap()),
+            parse_hex_string_as_bytes(tx["hash"].as_str().unwrap()),
+        ) {
+            (Ok(from), Ok(to), Ok(hash)) => transactions.push(Transaction {
+                from,
+                to,
+                value: tx["value"].as_u64().unwrap() as u32,
+                hash,
+            }),
+            _ => return Err("Unable to process genesis file"),
+        };
+    }
+
+    let mut genesis = Block {
         hash: Default::default(),
         parent_hash: Default::default(),
-        transactions: Default::default(),
-        timestamp: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
+        transactions,
+        timestamp: genesis["timestamp"].as_u64().unwrap(),
+    };
+
+    genesis.hash = genesis.hash_block(0);
+
+    Ok(genesis)
+}
+
+pub fn run(config: Config) {
+    let genesis = match config.genesis_file {
+        Some(filename) => init_genesis(&filename).unwrap(),
+        None => Block {
+            hash: Default::default(),
+            parent_hash: Default::default(),
+            transactions: Default::default(),
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        },
     };
 
     let mut blockchain = Blockchain::new(genesis);
@@ -89,28 +163,38 @@ impl Blockchain {
     }
 }
 
-#[derive(Clone, PartialEq, Default, Copy)]
-pub struct Bytes32([u8; 32]);
+#[derive(Clone, PartialEq, Default, Copy, Deserialize, Serialize)]
+pub struct Bytes<T: AsRef<[u8]>>(T);
 
-impl Debug for Bytes32 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self.0)
-    }
+type Bytes32 = Bytes<[u8; 32]>;
+
+type Address = Bytes<[u8; 20]>;
+
+macro_rules! impl_traits_for_bytes {
+    (for $($t:ty), +) => {
+        $(impl Debug for $t {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{:?}", self.0)
+            }
+        }
+
+        impl Display for $t {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "0x{}", self.encode_hex::<String>())
+            }
+        }
+
+        impl AsRef<[u8]> for $t {
+            fn as_ref(&self) -> &[u8] {
+                &self.0
+            }
+        })*
+    };
 }
 
-impl Display for Bytes32 {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "0x{}", self.encode_hex::<String>())
-    }
-}
+impl_traits_for_bytes!(for Bytes32, Address);
 
-impl AsRef<[u8]> for Bytes32 {
-    fn as_ref(&self) -> &[u8] {
-        &self.0
-    }
-}
-
-#[derive(Debug, PartialEq, Clone)]
+#[derive(Debug, PartialEq, Clone, Serialize)]
 pub struct Block {
     pub hash: Bytes32,
     pub parent_hash: Bytes32,
@@ -145,92 +229,76 @@ impl Block {
         hasher.input(&nonce.to_be_bytes());
         hasher.result(&mut hash);
 
-        Bytes32(hash)
+        Bytes(hash)
     }
 }
 
-impl Serialize for Block {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut s = serializer.serialize_struct("block", 3).unwrap();
-        s.serialize_field("hash", &self.hash.as_ref())?;
-        s.serialize_field("parent_hash", &self.parent_hash.as_ref())?;
-        s.serialize_field("transactions", &self.transactions)?;
-        s.serialize_field("timestamp", &self.timestamp)?;
-        s.end()
-    }
-}
-
-type Address = [u8; 20];
-
-#[derive(Debug, PartialEq, Clone, Default)]
+#[derive(Debug, PartialEq, Clone, Default, Deserialize, Serialize)]
 pub struct Transaction {
     pub from: Address,
     pub to: Address,
     pub value: u32,
-    pub hash: [u8; 32],
-}
-
-impl Serialize for Transaction {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut s = serializer.serialize_struct("transaction", 4).unwrap();
-        s.serialize_field("from", &self.from)?;
-        s.serialize_field("to", &self.to)?;
-        s.serialize_field("value", &self.value)?;
-        s.serialize_field("hash", &self.hash)?;
-        s.end()
-    }
+    pub hash: Bytes32,
 }
 
 // mod tests {
 //     use super::*;
 //     use std::clone;
 
-//     const GENESIS: Block = Block {
-//         hash: [0; 32],
-//         parent_hash: [0; 32],
-//         transactions: Vec::new(),
+// const GENESIS: Block = Block {
+//     hash: [0; 32],
+//     parent_hash: [0; 32],
+//     transactions: Vec::new(),
+// };
+
+// const TRANSACTIONS: [Transaction; 2] = [Transaction {}, Transaction {}];
+
+// fn init() -> Blockchain {
+//     let mut blockchain = Blockchain::new(GENESIS);
+//     blockchain.transactions = Vec::from(TRANSACTIONS);
+
+//     blockchain
+// }
+
+// #[test]
+// fn create_blockchain() {
+//     let blockchain = init();
+
+//     assert_eq!(blockchain.chain[0], GENESIS);
+//     assert_eq!(blockchain.transactions[0..1], TRANSACTIONS);
+// }
+
+// #[test]
+// fn create_block() {
+//     let block = Block {
+//         hash: ,
+//         parent_hash: GENESIS.hash,
+//         transactions: Vec
 //     };
 
-//     const TRANSACTIONS: [Transaction; 2] = [Transaction {}, Transaction {}];
+//     let blockchain = init();
+//     let parent_hash = blockchain.chain[0].hash;
 
-//     fn init() -> Blockchain {
-//         let mut blockchain = Blockchain::new(GENESIS);
-//         blockchain.transactions = Vec::from(TRANSACTIONS);
+//     let mut txs: Vec<Transaction>;
+//     txs.clone_from_slice(&blockchain.transactions[0..1]);
 
-//         blockchain
-//     }
+//     let mut new_block = Block::new(parent_hash, txs);
 
-//     #[test]
-//     fn create_blockchain() {
-//         let blockchain = init();
+//     assert_eq!(block, new_block);
+//     assert_eq!(block, new_block);
+// }
 
-//         assert_eq!(blockchain.chain[0], GENESIS);
-//         assert_eq!(blockchain.transactions[0..1], TRANSACTIONS);
-//     }
+// #[test]
+// fn test_parse_hex_string() {
+//     let hex_string = "9b00b72c6bb7a8761a0730b7f5d6090229aacbb57f96d83b4e5bc6866b385d32";
+//     let test_bytes = [
+//         155, 0, 183, 44, 107, 183, 168, 118, 26, 7, 48, 183, 245, 214, 9, 2, 41, 170, 203, 181,
+//         127, 150, 216, 59, 78, 91, 198, 134, 107, 56, 93, 50,
+//     ];
+//     let bytes = parse_hex_string_as_bytes(hex_string);
 
-//     // #[test]
-//     // fn create_block() {
-//     //     let block = Block {
-//     //         hash: ,
-//     //         parent_hash: GENESIS.hash,
-//     //         transactions: Vec
-//     //     };
+//     // println!("{:?}", bytes);
 
-//     //     let blockchain = init();
-//     //     let parent_hash = blockchain.chain[0].hash;
-
-//     //     let mut txs: Vec<Transaction>;
-//     //     txs.clone_from_slice(&blockchain.transactions[0..1]);
-
-//     //     let mut new_block = Block::new(parent_hash, txs);
-
-//     //     assert_eq!(block, new_block);
-//     //     assert_eq!(block, new_block);
-//     // }
+//     assert_eq!(bytes, Bytes32(test_bytes));
+// }
 // }
